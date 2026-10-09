@@ -1,0 +1,98 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "dns-prometheus",
+    "title": "DNS Server (Prometheus)",
+    "tags": ["dns", "prometheus", "imperial"],
+    "timezone": "browser",
+    "schemaVersion": 39,
+    "refresh": "5s",
+    "time": { "from": "now-15m", "to": "now" },
+    "panels": [
+      {
+        "id": 1,
+        "title": "DNS Query Rate (QPS)",
+        "type": "timeseries",
+        "datasource": { "type": "prometheus", "uid": "afsl3hnnbm328c" },
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+        "targets": [
+          {
+            "expr": "sum(rate(dns_queries_total[1m])) by (status)",
+            "legendFormat": "{{status}}",
+            "refId": "A"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Top Domains (last 5m)",
+        "type": "barchart",
+        "datasource": { "type": "prometheus", "uid": "afsl3hnnbm328c" },
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+        "targets": [
+          {
+            "expr": "topk(10, sum(increase(dns_queries_total[5m])) by (domain))",
+            "legendFormat": "{{domain}}",
+            "refId": "A",
+            "instant": true
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "DNS Latency (p50 / p95 / p99)",
+        "type": "timeseries",
+        "datasource": { "type": "prometheus", "uid": "afsl3hnnbm328c" },
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, sum(rate(dns_latency_seconds_bucket[5m])) by (le))",
+            "legendFormat": "p50",
+            "refId": "A"
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(dns_latency_seconds_bucket[5m])) by (le))",
+            "legendFormat": "p95",
+            "refId": "B"
+          },
+          {
+            "expr": "histogram_quantile(0.99, sum(rate(dns_latency_seconds_bucket[5m])) by (le))",
+            "legendFormat": "p99",
+            "refId": "C"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Blocked Queries Total",
+        "type": "stat",
+        "datasource": { "type": "prometheus", "uid": "afsl3hnnbm328c" },
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+        "targets": [
+          {
+            "expr": "sum(dns_blocked_total)",
+            "legendFormat": "Blocked",
+            "refId": "A",
+            "instant": true
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Blocked Domains (top 10)",
+        "type": "table",
+        "datasource": { "type": "prometheus", "uid": "afsl3hnnbm328c" },
+        "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+        "targets": [
+          {
+            "expr": "sort_desc(dns_blocked_total)",
+            "format": "table",
+            "instant": true,
+            "refId": "A"
+          }
+        ]
+      }
+    ]
+  },
+  "overwrite": true
+}

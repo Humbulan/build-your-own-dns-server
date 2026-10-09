@@ -1,0 +1,12 @@
+{
+  "receiver": "grafana-default-email",
+  "group_by": ["grafana_folder", "alertname"],
+  "routes": [
+    {
+      "receiver": "Imperial Slack Alerts",
+      "matchers": ["service=dns"],
+      "group_by": ["alertname"],
+      "continue": false
+    }
+  ]
+}

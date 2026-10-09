@@ -1,0 +1,45 @@
+{
+  "title": "DNS Latency High (p95 > 500ms)",
+  "ruleGroup": "dns-alerts",
+  "folderUID": "dfzwug6zghhq8b",
+  "condition": "B",
+  "for": "2m",
+  "noDataState": "NoData",
+  "execErrState": "Error",
+  "annotations": {
+    "summary": "DNS p95 latency exceeded 500ms for 2 minutes",
+    "description": "Check resolver health at {{ $labels.instance }}"
+  },
+  "labels": { "severity": "warning", "service": "dns" },
+  "data": [
+    {
+      "refId": "A",
+      "queryType": "",
+      "relativeTimeRange": { "from": 300, "to": 0 },
+      "datasourceUid": "afsl3hnnbm328c",
+      "model": {
+        "expr": "histogram_quantile(0.95, sum(rate(dns_latency_seconds_bucket[5m])) by (le))",
+        "refId": "A",
+        "instant": true
+      }
+    },
+    {
+      "refId": "B",
+      "queryType": "",
+      "relativeTimeRange": { "from": 300, "to": 0 },
+      "datasourceUid": "__expr__",
+      "model": {
+        "type": "threshold",
+        "refId": "B",
+        "conditions": [{
+          "evaluator": { "params": [0.5], "type": "gt" },
+          "operator": { "type": "and" },
+          "query": { "params": ["A"] },
+          "reducer": { "type": "last" },
+          "type": "query"
+        }],
+        "expression": "A"
+      }
+    }
+  ]
+}

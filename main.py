@@ -2,268 +2,325 @@ import socket
 import struct
 import sys
 import argparse
+import pymysql
+import threading
+import queue
+import time
+from prometheus_client import CollectorRegistry, Counter, Histogram, push_to_gateway
 
+# ============================================================
+# CONFIG
+# ============================================================
+DB_HOST = '127.0.0.1'
+DB_USER = 'root'
+DB_PASS = 'RootStrongPass123!'
+DB_NAME = 'imperial_nexus'
+DB_PORT = 3306
+PUSHGATEWAY = 'localhost:9092'
+JOB_NAME = 'dns_server'
+INSTANCE = 'imperial-dns-01'
+
+# ============================================================
+# PROMETHEUS METRICS
+# ============================================================
+prom_registry = CollectorRegistry()
+prom_queries   = Counter('dns_queries_total', 'Total DNS queries',
+                         ['domain', 'qtype', 'status'], registry=prom_registry)
+prom_blocked   = Counter('dns_blocked_total', 'Blocked DNS queries',
+                         ['domain'], registry=prom_registry)
+prom_forwarded = Counter('dns_forwarded_total', 'Forwarded DNS queries',
+                         registry=prom_registry)
+prom_latency   = Histogram('dns_latency_seconds', 'DNS forwarding latency',
+                           buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0],
+                           registry=prom_registry)
+
+# ============================================================
+# BLOCKLIST (in-memory cache, refreshed from DB)
+# ============================================================
+blocklist_cache = set()
+blocklist_lock = threading.Lock()
+
+def load_blocklist():
+    global blocklist_cache
+    try:
+        conn = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASS,
+                               database=DB_NAME, port=DB_PORT, connect_timeout=2)
+        with conn.cursor() as cur:
+            cur.execute("SELECT domain_pattern FROM dns_blocklist WHERE enabled = 1")
+            rows = cur.fetchall()
+        conn.close()
+        with blocklist_lock:
+            blocklist_cache = {r[0].lower() for r in rows}
+        if len(blocklist_cache) != globals().get("_last_bl_count", -1):
+            globals()["_last_bl_count"] = len(blocklist_cache)
+            print(f"[Blocklist] Loaded {len(blocklist_cache)} rules")
+    except Exception as e:
+        print(f"[Blocklist] Load failed: {e}")
+
+def is_blocked(domain):
+    d = domain.lower()
+    with blocklist_lock:
+        rules = list(blocklist_cache)
+    for rule in rules:
+        if d == rule or d.endswith('.' + rule):
+            return True
+    return False
+
+def blocklist_refresh_worker():
+    load_blocklist()
+    while True:
+        time.sleep(60)
+        load_blocklist()
+
+# ============================================================
+# PROMETHEUS PUSH WORKER
+# ============================================================
+def prometheus_push_worker():
+    while True:
+        time.sleep(15)
+        try:
+            push_to_gateway(PUSHGATEWAY, job=JOB_NAME, registry=prom_registry)
+        except Exception as e:
+            print(f"[Prom] Push failed: {e}")
+
+# ============================================================
+# DNS PARSING / BUILDING
+# ============================================================
 def parse_arguments():
     parser = argparse.ArgumentParser(description='DNS Forwarding Server')
-    parser.add_argument('--resolver', required=True, help='Resolver address in format IP:PORT')
+    parser.add_argument('--resolver', required=True, help='Resolver address IP:PORT')
     return parser.parse_args()
 
 def parse_dns_header(data):
-    """Parse DNS header from received data"""
     if len(data) < 12:
         return None
     id, flags, qdcount, ancount, nscount, arcount = struct.unpack('>HHHHHH', data[:12])
-    
-    qr = (flags >> 15) & 0x1
-    opcode = (flags >> 11) & 0xF
-    aa = (flags >> 10) & 0x1
-    tc = (flags >> 9) & 0x1
-    rd = (flags >> 8) & 0x1
-    ra = (flags >> 7) & 0x1
-    z = (flags >> 4) & 0x7
-    rcode = flags & 0xF
-    
     return {
-        'id': id,
-        'qr': qr,
-        'opcode': opcode,
-        'aa': aa,
-        'tc': tc,
-        'rd': rd,
-        'ra': ra,
-        'z': z,
-        'rcode': rcode,
-        'qdcount': qdcount,
-        'ancount': ancount,
-        'nscount': nscount,
-        'arcount': arcount
+        'id': id, 'qr': (flags >> 15) & 0x1, 'opcode': (flags >> 11) & 0xF,
+        'aa': (flags >> 10) & 0x1, 'tc': (flags >> 9) & 0x1,
+        'rd': (flags >> 8) & 0x1, 'ra': (flags >> 7) & 0x1,
+        'z': (flags >> 4) & 0x7, 'rcode': flags & 0xF,
+        'qdcount': qdcount, 'ancount': ancount,
+        'nscount': nscount, 'arcount': arcount
     }
 
 def parse_domain_name(data, offset):
-    """Parse domain name, handling compression pointers"""
     labels = []
-    original_offset = offset
-    
     while offset < len(data):
-        length = data[offset]
-        offset += 1
-        
-        if length == 0:
-            break
+        length = data[offset]; offset += 1
+        if length == 0: break
         elif length & 0xC0 == 0xC0:
-            pointer_offset = ((length & 0x3F) << 8) | data[offset]
-            offset += 1
-            compressed_labels, _ = parse_domain_name(data, pointer_offset)
-            labels.extend(compressed_labels)
-            break
+            ptr = ((length & 0x3F) << 8) | data[offset]; offset += 1
+            cl, _ = parse_domain_name(data, ptr); labels.extend(cl); break
         else:
-            label = data[offset:offset+length]
-            labels.append(label)
-            offset += length
-    
+            labels.append(data[offset:offset+length]); offset += length
     return labels, offset
 
 def parse_dns_questions(data, qdcount, start_offset=12):
-    """Parse all DNS question sections from received data"""
     questions = []
     offset = start_offset
-    
-    for i in range(qdcount):
+    for _ in range(qdcount):
         labels, offset = parse_domain_name(data, offset)
-        
-        domain_name_bytes = b''
+        dnb = b''
         for label in labels:
-            domain_name_bytes += bytes([len(label)]) + label
-        domain_name_bytes += b'\x00'
-        
-        if offset + 4 > len(data):
-            break
-            
-        qtype = struct.unpack('>H', data[offset:offset+2])[0]
-        offset += 2
-        qclass = struct.unpack('>H', data[offset:offset+2])[0]
-        offset += 2
-        
-        questions.append({
-            'domain_name': domain_name_bytes,
-            'qtype': qtype,
-            'qclass': qclass,
-            'offset': start_offset
-        })
-        start_offset = offset
-    
+            dnb += bytes([len(label)]) + label
+        dnb += b'\x00'
+        if offset + 4 > len(data): break
+        qtype = struct.unpack('>H', data[offset:offset+2])[0]; offset += 2
+        qclass = struct.unpack('>H', data[offset:offset+2])[0]; offset += 2
+        questions.append({'domain_name': dnb, 'qtype': qtype, 'qclass': qclass, 'labels': labels})
     return questions, offset
 
-def build_dns_header(id, qdcount=1, ancount=0, is_response=True, opcode=0, rd=0):
-    """Build DNS header"""
+def build_dns_header(id, qdcount=1, ancount=0, is_response=True, opcode=0, rd=0, rcode=0):
     flags = 0
-    if is_response:
-        flags |= (1 << 15)
-    flags |= (opcode << 11)
-    flags |= (rd << 8)
-    
+    if is_response: flags |= (1 << 15)
+    flags |= (opcode << 11); flags |= (rd << 8); flags |= rcode
     return struct.pack('>HHHHHH', id, flags, qdcount, ancount, 0, 0)
 
 def build_dns_question(question):
-    """Build a single question section"""
     return question['domain_name'] + struct.pack('>HH', question['qtype'], question['qclass'])
 
-def forward_single_query(question_data, resolver_addr, resolver_port, query_id):
-    """Forward a single question to resolver and return response"""
-    try:
-        forward_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        forward_socket.settimeout(2.0)
-        
-        forward_socket.sendto(question_data, (resolver_addr, resolver_port))
-        resolver_data, _ = forward_socket.recvfrom(512)
-        forward_socket.close()
-        
-        return resolver_data
-    except socket.timeout:
-        print(f"Timeout waiting for resolver for query {query_id}")
-        return None
-    except Exception as e:
-        print(f"Error forwarding query {query_id}: {e}")
-        return None
+def build_sinkhole_response(original_header, question):
+    """Return 0.0.0.0 for the queried domain (blocked)."""
+    header = build_dns_header(original_header['id'], qdcount=1, ancount=1,
+                              is_response=True, opcode=original_header['opcode'],
+                              rd=original_header['rd'], rcode=0)
+    q_bytes = build_dns_question(question)
+    answer = (question['domain_name'] +
+              struct.pack('>H', 1) +                     # Type A
+              struct.pack('>H', 1) +                     # Class IN
+              struct.pack('>I', 60) +                    # TTL
+              struct.pack('>H', 4) +                     # rdlength
+              struct.pack('>BBBB', 0, 0, 0, 0))          # 0.0.0.0
+    return header + q_bytes + answer
 
+# ============================================================
+# DB LOGGING
+# ============================================================
+QTYPE_MAP = {1:'A',2:'NS',5:'CNAME',6:'SOA',12:'PTR',15:'MX',16:'TXT',28:'AAAA',33:'SRV',255:'ANY'}
+log_queue = queue.Queue(maxsize=2000)
+
+def db_log_worker():
+    conn = None
+    while True:
+        entry = log_queue.get()
+        if entry is None: break
+        if conn is None:
+            try:
+                conn = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASS,
+                                       database=DB_NAME, port=DB_PORT,
+                                       connect_timeout=2, autocommit=True)
+            except Exception as e:
+                print(f"[DB Log] Connect failed: {e}"); conn = None; continue
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO dns_query_logs "
+                    "(client_ip, domain_name, query_type, response_status, latency_ms, blocked) "
+                    "VALUES (%s, %s, %s, %s, %s, %s)",
+                    entry
+                )
+        except Exception as e:
+            print(f"[DB Log] Insert failed: {e}")
+            try: conn.close()
+            except: pass
+            conn = None
+    if conn:
+        try: conn.close()
+        except: pass
+
+def log_dns_query(client_ip, domain, qtype, status="NOERROR", latency_ms=None, blocked=0):
+    try:
+        log_queue.put_nowait((client_ip, domain, qtype, status, latency_ms, blocked))
+    except queue.Full:
+        pass
+
+def extract_domain_str(dnb):
+    try:
+        parts = []; i = 0
+        while i < len(dnb):
+            l = dnb[i]
+            if l == 0: break
+            i += 1
+            parts.append(dnb[i:i+l].decode('ascii', errors='replace')); i += l
+        return '.'.join(parts)
+    except Exception:
+        return '?'
+
+# ============================================================
+# FORWARDING
+# ============================================================
+def forward_single_query(question_data, resolver_addr, resolver_port, query_id):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(2.0)
+        s.sendto(question_data, (resolver_addr, resolver_port))
+        data, _ = s.recvfrom(512)
+        s.close()
+        return data
+    except socket.timeout:
+        print(f"Timeout for query {query_id}"); return None
+    except Exception as e:
+        print(f"Error forwarding {query_id}: {e}"); return None
+
+# ============================================================
+# MAIN
+# ============================================================
 def main():
     args = parse_arguments()
-    
-    # Parse resolver address
     resolver_addr, resolver_port_str = args.resolver.split(':', 1)
     resolver_port = int(resolver_port_str)
-    
+
     print(f"Starting DNS forwarding server on port 2053")
     print(f"Forwarding to resolver: {resolver_addr}:{resolver_port}")
-    
-    # Create server socket
+
+    threading.Thread(target=db_log_worker, daemon=True).start()
+    print("DB logging thread started")
+    threading.Thread(target=blocklist_refresh_worker, daemon=True).start()
+    print("Blocklist refresh thread started")
+    threading.Thread(target=prometheus_push_worker, daemon=True).start()
+    print(f"Prometheus push thread started (gateway={PUSHGATEWAY})")
+
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server_socket.bind(("127.0.0.1", 2053))
-    
+
     query_counter = 1000
-    
+
     while True:
         try:
-            # Receive DNS query from client
             data, client_addr = server_socket.recvfrom(512)
-            print(f"Received {len(data)} bytes from client {client_addr}")
-            
-            # Parse the original query header
+            client_ip = client_addr[0]
+
             original_header = parse_dns_header(data)
-            if not original_header:
-                print("Invalid DNS header")
-                continue
-            
-            # Parse all questions
+            if not original_header: continue
+
             questions, _ = parse_dns_questions(data, original_header['qdcount'])
-            print(f"Found {len(questions)} questions in query")
-            
-            if len(questions) == 1:
-                # Single question - forward directly
-                forward_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                forward_socket.settimeout(2.0)
-                
-                try:
-                    forward_socket.sendto(data, (resolver_addr, resolver_port))
-                    resolver_data, _ = forward_socket.recvfrom(512)
-                    
-                    # Send response back to client
-                    server_socket.sendto(resolver_data, client_addr)
-                    print("Sent single response back to client")
-                    
-                except socket.timeout:
-                    print("Timeout waiting for resolver")
-                    # Send error response
-                    if len(data) >= 12:
-                        query_id = struct.unpack('>H', data[0:2])[0]
-                        error_flags = (1 << 15) | 2  # QR=1, RCODE=2
-                        error_header = struct.pack('>HHHHHH', query_id, error_flags, 1, 0, 0, 0)
-                        error_response = error_header + data[12:]
-                        server_socket.sendto(error_response, client_addr)
-                        print("Sent error response to client")
-                finally:
-                    forward_socket.close()
-                    
-            else:
-                # Multiple questions - handle each separately
-                print(f"Handling {len(questions)} questions separately")
-                responses = []
-                
-                for i, question in enumerate(questions):
-                    query_counter += 1
-                    # Build individual query for this question
-                    query_header = build_dns_header(
-                        query_counter,
-                        qdcount=1,
-                        ancount=0,
-                        is_response=False,
-                        opcode=original_header['opcode'],
-                        rd=original_header['rd']
-                    )
-                    query_data = query_header + build_dns_question(question)
-                    
-                    resolver_response = forward_single_query(
-                        query_data, resolver_addr, resolver_port, query_counter
-                    )
-                    
-                    if resolver_response:
-                        responses.append((question, resolver_response))
-                        print(f"Got response for question {i+1}")
-                    else:
-                        print(f"No response for question {i+1}")
-                
-                if responses:
-                    # Build merged response
-                    total_answers = 0
-                    for _, resp_data in responses:
-                        resp_header = parse_dns_header(resp_data)
-                        if resp_header:
-                            total_answers += resp_header['ancount']
-                    
-                    # Build response header
-                    response_header = build_dns_header(
-                        original_header['id'],
-                        qdcount=len(questions),
-                        ancount=total_answers,
-                        is_response=True,
-                        opcode=original_header['opcode'],
-                        rd=original_header['rd']
-                    )
-                    
-                    # Build question section (all questions)
-                    question_section = b''.join(build_dns_question(q) for q in questions)
-                    
-                    # Build answer section (all answers)
-                    answer_section = b''
-                    for question, resp_data in responses:
-                        resp_header = parse_dns_header(resp_data)
-                        if resp_header and resp_header['ancount'] > 0:
-                            # Extract answer section from response
-                            # Find where answer section starts
-                            q_start = 12
-                            for j in range(resp_header['qdcount']):
-                                _, q_end = parse_domain_name(resp_data, q_start)
-                                q_start = q_end + 4
-                            
-                            answer_section += resp_data[q_start:]
-                    
-                    merged_response = response_header + question_section + answer_section
-                    server_socket.sendto(merged_response, client_addr)
-                    print(f"Sent merged response with {total_answers} answers")
+            if not questions: continue
+
+            # Handle each question individually
+            for question in questions:
+                domain = extract_domain_str(question['domain_name'])
+                qtype_str = QTYPE_MAP.get(question['qtype'], str(question['qtype']))
+
+                # Blocklist check
+                if is_blocked(domain):
+                    print(f"[BLOCKED] {domain}")
+                    sinkhole = build_sinkhole_response(original_header, question)
+                    server_socket.sendto(sinkhole, client_addr)
+                    log_dns_query(client_ip, domain, qtype_str, "BLOCKED", 0.0, 1)
+                    prom_blocked.labels(domain=domain).inc()
+                    prom_queries.labels(domain=domain, qtype=qtype_str, status="BLOCKED").inc()
+                    continue
+
+                # Forward and measure latency
+                if len(questions) == 1:
+                    start = time.time()
+                    forward_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    forward_socket.settimeout(2.0)
+                    try:
+                        forward_socket.sendto(data, (resolver_addr, resolver_port))
+                        resolver_data, _ = forward_socket.recvfrom(512)
+                        latency = time.time() - start
+                        server_socket.sendto(resolver_data, client_addr)
+                        log_dns_query(client_ip, domain, qtype_str, "NOERROR", latency*1000, 0)
+                        prom_latency.observe(latency)
+                        prom_forwarded.inc()
+                        prom_queries.labels(domain=domain, qtype=qtype_str, status="NOERROR").inc()
+                        print(f"[FWD] {domain} -> {latency*1000:.1f}ms")
+                    except socket.timeout:
+                        err_flags = (1 << 15) | 2
+                        err_hdr = struct.pack('>HHHHHH', original_header['id'], err_flags, 1, 0, 0, 0)
+                        server_socket.sendto(err_hdr + data[12:], client_addr)
+                        log_dns_query(client_ip, domain, qtype_str, "SERVFAIL", 2000.0, 0)
+                        prom_queries.labels(domain=domain, qtype=qtype_str, status="SERVFAIL").inc()
+                    finally:
+                        forward_socket.close()
                 else:
-                    # Send error response
-                    error_header = build_dns_header(
-                        original_header['id'],
-                        qdcount=len(questions),
-                        ancount=0,
-                        is_response=True
-                    )
-                    error_questions = b''.join(build_dns_question(q) for q in questions)
-                    server_socket.sendto(error_header + error_questions, client_addr)
-                    print("Sent error response for multiple questions")
-                
+                    # Multi-question: forward individually
+                    query_counter += 1
+                    qh = build_dns_header(query_counter, qdcount=1, ancount=0,
+                                          is_response=False,
+                                          opcode=original_header['opcode'],
+                                          rd=original_header['rd'])
+                    qd = qh + build_dns_question(question)
+                    start = time.time()
+                    resp = forward_single_query(qd, resolver_addr, resolver_port, query_counter)
+                    latency = time.time() - start
+                    if resp:
+                        # Rebuild header with original ID
+                        fixed = struct.pack('>H', original_header['id']) + resp[2:]
+                        server_socket.sendto(fixed, client_addr)
+                        log_dns_query(client_ip, domain, qtype_str, "NOERROR", latency*1000, 0)
+                        prom_latency.observe(latency)
+                        prom_forwarded.inc()
+                        prom_queries.labels(domain=domain, qtype=qtype_str, status="NOERROR").inc()
+                    else:
+                        log_dns_query(client_ip, domain, qtype_str, "SERVFAIL", None, 0)
+                        prom_queries.labels(domain=domain, qtype=qtype_str, status="SERVFAIL").inc()
+
         except KeyboardInterrupt:
-            print("\nShutting down server...")
+            print("\nShutting down...")
+            log_queue.put(None)
             break
         except Exception as e:
             print(f"Error: {e}")

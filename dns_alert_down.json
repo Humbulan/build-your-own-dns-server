@@ -1,0 +1,45 @@
+{
+  "title": "DNS Server Down (no queries in 5m)",
+  "ruleGroup": "dns-alerts",
+  "folderUID": "dfzwug6zghhq8b",
+  "condition": "B",
+  "for": "5m",
+  "noDataState": "Alerting",
+  "execErrState": "Error",
+  "annotations": {
+    "summary": "No DNS queries received in last 5 minutes — server may be down",
+    "description": "Check if main.py process is running on port 2053"
+  },
+  "labels": { "severity": "critical", "service": "dns" },
+  "data": [
+    {
+      "refId": "A",
+      "queryType": "",
+      "relativeTimeRange": { "from": 300, "to": 0 },
+      "datasourceUid": "afsl3hnnbm328c",
+      "model": {
+        "expr": "sum(rate(dns_queries_total[5m]))",
+        "refId": "A",
+        "instant": true
+      }
+    },
+    {
+      "refId": "B",
+      "queryType": "",
+      "relativeTimeRange": { "from": 300, "to": 0 },
+      "datasourceUid": "__expr__",
+      "model": {
+        "type": "threshold",
+        "refId": "B",
+        "conditions": [{
+          "evaluator": { "params": [0], "type": "lt" },
+          "operator": { "type": "and" },
+          "query": { "params": ["A"] },
+          "reducer": { "type": "last" },
+          "type": "query"
+        }],
+        "expression": "A"
+      }
+    }
+  ]
+}

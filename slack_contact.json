@@ -1,0 +1,9 @@
+{
+  "name": "Imperial Slack Alerts",
+  "type": "slack",
+  "settings": {
+    "url": "https://hooks.slack.com/services/YOUR/WEBHOOK/HERE",
+    "title": "{{ .CommonLabels.alertname }}",
+    "text": "*Severity:* {{ .CommonLabels.severity }}\n*Service:* {{ .CommonLabels.service }}\n\n{{ .CommonAnnotations.summary }}\n\n{{ .CommonAnnotations.description }}"
+  }
+}
